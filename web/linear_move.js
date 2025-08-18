@@ -4,28 +4,35 @@ import { $el } from "../../scripts/ui.js";
 import { debug, _name, _endpoint, api_get, api_post } from "./utils.js";
 
 // ===============================================
-// MovementManager - ノード移動拡張機能を管理するクラス
+// MovementManager - 最適化されたノード移動拡張機能
 // ===============================================
 class MovementManager {
     constructor() {
         // 基本設定
-        this.enableArrowMove = true; // 矢印キー移動の有効/無効
-        this.moveStep = 100; // デフォルトの移動量
-        this.moveStepShift = 200;
-        this.moveStepCtrl = 10;
+        this.enableArrowMove = true;
+        this.moveSteps = 100;
+        this.moveStepsShift = 200;
+        this.moveStepsCtrl = 10;
 
+        // Shift+ドラッグ制限の状態
+        this.shiftDragState = {
+            active: false,
+            startMouse: { x: 0, y: 0 },
+            nodeStartPositions: new Map(),
+            direction: null, // 'horizontal', 'vertical', null
+            threshold: 10
+        };
+        
+        // イベントハンドラーをバインド（一度だけ）
+        this.boundHandlers = {
+            keydown: this.handleKeyDown.bind(this),
+            shiftKeyUp: this.handleShiftKeyUp.bind(this),
+            pointerDown: this.handlePointerDown.bind(this),
+            pointerMove: this.handlePointerMove.bind(this),
+            pointerUp: this.handlePointerUp.bind(this)
+        };
+        
         this.isInitialized = false;
-        
-        // Shift+ドラッグ制限機能の状態
-        this.isShiftDragging = false;
-        this.dragStartMouse = { x: 0, y: 0 };
-        this.nodeStartPositions = new Map();
-        this.constraintDirection = null; // 'horizontal', 'vertical', null
-        this.dragThreshold = 10; // 方向決定の閾値（ピクセル）
-        
-        // バインドしたメソッド
-        this.handleKeyDown = this.handleKeyDown.bind(this);
-        this.handleShiftKeyChange = this.handleShiftKeyChange.bind(this);
     }
     
     // ===============================================
@@ -34,272 +41,199 @@ class MovementManager {
     initialize() {
         if (this.isInitialized) return;
         
-        // キーボードイベントの設定
-        this.setupKeyboardEvents();
-        
-        // Shift+ドラッグ制限機能の設定
-        this.setupShiftDragConstraint();
-        
+        this.setupEventListeners();
         this.isInitialized = true;
     }
     
     cleanup() {
         if (!this.isInitialized) return;
         
-        // キーボードイベントの削除
-        app.canvasEl.removeEventListener('keydown', this.handleKeyDown, { capture: true });
-        document.removeEventListener('keydown', this.handleKeyDown, { capture: true });
-        document.removeEventListener('keydown', this.handleShiftKeyChange, { capture: true });
-        document.removeEventListener('keyup', this.handleShiftKeyChange, { capture: true });
-        
+        this.removeEventListeners();
+        this.resetShiftDrag();
         this.isInitialized = false;
     }
     
-    // ===============================================
-    // キーボード移動機能
-    // ===============================================
-    setupKeyboardEvents() {
-        // キーボードイベントの設定
-        app.canvasEl.addEventListener('keydown', this.handleKeyDown, { 
-            capture: true,
-            passive: false 
-        });
+    setupEventListeners() {
+        // キーボードイベント
+        document.addEventListener('keydown', this.boundHandlers.keydown, { capture: true, passive: false });
+        document.addEventListener('keyup', this.boundHandlers.shiftKeyUp, { capture: true });
         
-        document.addEventListener('keydown', this.handleKeyDown, { 
-            capture: true,
-            passive: false 
-        });
-        
-        // Shiftキーの状態監視
-        document.addEventListener('keydown', this.handleShiftKeyChange, { capture: true });
-        document.addEventListener('keyup', this.handleShiftKeyChange, { capture: true });
+        // ポインターイベント（Shift+ドラッグ制限用）
+        app.canvasEl.addEventListener('pointerdown', this.boundHandlers.pointerDown, { capture: true });
+        app.canvasEl.addEventListener('pointermove', this.boundHandlers.pointerMove, { capture: true });
+        app.canvasEl.addEventListener('pointerup', this.boundHandlers.pointerUp, { capture: true });
     }
     
+    removeEventListeners() {
+        document.removeEventListener('keydown', this.boundHandlers.keydown, { capture: true });
+        document.removeEventListener('keyup', this.boundHandlers.shiftKeyUp, { capture: true });
+        
+        app.canvasEl.removeEventListener('pointerdown', this.boundHandlers.pointerDown, { capture: true });
+        app.canvasEl.removeEventListener('pointermove', this.boundHandlers.pointerMove, { capture: true });
+        app.canvasEl.removeEventListener('pointerup', this.boundHandlers.pointerUp, { capture: true });
+    }
+    
+    // ===============================================
+    // ユーティリティ関数
+    // ===============================================
     canNodeMove() {
-        // 入力フィールドにフォーカスがある場合は無効
         const activeElement = document.activeElement;
         
-        if (activeElement?.tagName === "INPUT" ||
-            activeElement?.tagName === "TEXTAREA" || 
-            activeElement?.isContentEditable) {
-                return false;
+        // 入力フィールドにフォーカスがある場合は無効
+        const inputTags = ['INPUT', 'TEXTAREA'];
+        if (inputTags.includes(activeElement?.tagName) || activeElement?.isContentEditable) {
+            return false;
         }
         
         // 画像表示エリアでも、ノードが選択されていれば移動を許可
-        if (activeElement?.classList?.contains('comfy-image') ||
-            activeElement?.classList?.contains('image-preview') ||
-            activeElement?.tagName === 'CANVAS' ||
-            activeElement?.tagName === 'IMG') {
-            const selectedNodes = this.getSelectedNodes();
-            return selectedNodes.length > 0;
+        const imageClasses = ['comfy-image', 'image-preview'];
+        const imageTags = ['CANVAS', 'IMG'];
+        if (imageClasses.some(cls => activeElement?.classList?.contains(cls)) || 
+            imageTags.includes(activeElement?.tagName)) {
+            return this.getSelectedNodes().length > 0;
         }
 
         return true;
     }
 
     getSelectedNodes() {
-        const selected_nodes = app.canvas.selected_nodes;
-        if (typeof selected_nodes === "object") {
-            return Object.values(selected_nodes);
-        }
-        return [];
+        const selectedNodes = app.canvas.selected_nodes;
+        return typeof selectedNodes === "object" ? Object.values(selectedNodes) : [];
     }
     
-    moveNodesBy(dx, dy) {
+    moveNodes(dx, dy) {
         const nodes = this.getSelectedNodes();
-        if (nodes.length === 0) return;
+        if (nodes.length === 0) return false;
         
+        // ノード移動
         nodes.forEach(node => {
             node.pos[0] += dx;
             node.pos[1] += dy;
         });
         
-        // 選択オーバーレイも一緒に移動
+        // 選択オーバーレイも同期
         this.updateSelectionOverlay(dx, dy);
         
+        // キャンバス更新
         app.canvas.setDirty(true, true);
+        return true;
     }
     
-    moveNodesByArrow(direction, isShiftPressed = false, isCtrlPressed = false) {
-        let step = this.moveStep;
-        if (isShiftPressed) step = this.moveStepShift;
-        if (isCtrlPressed) step = this.moveStepCtrl;
-
-        switch (direction) {
-            case 'ArrowUp':
-                this.moveNodesBy(0, -step);
-                break;
-            case 'ArrowDown':
-                this.moveNodesBy(0, step);
-                break;
-            case 'ArrowLeft':
-                this.moveNodesBy(-step, 0);
-                break;
-            case 'ArrowRight':
-                this.moveNodesBy(step, 0);
-                break;
-        }
-    }
-    
+    // ===============================================
+    // キーボード移動機能
+    // ===============================================
     handleKeyDown(e) {
-        // 矢印キーのみ処理
-        if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+        const arrowKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+        
+        // 早期リターン条件をまとめて処理
+        if (!arrowKeys.includes(e.key) || 
+            !this.enableArrowMove || 
+            !this.canNodeMove() || 
+            this.getSelectedNodes().length === 0) {
             return;
         }
         
-        // 矢印キー移動が無効な場合は何もしない
-        if (!this.enableArrowMove) {
-            return;
-        }
-        
-        if (!this.canNodeMove()) return;
-
-        const nodes = this.getSelectedNodes();
-        if (nodes.length === 0) return;
-        
-        // イベントの伝播を停止
+        // イベント停止
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
 
-        // 修飾キーの状態を取得
-        const isShiftPressed = e.shiftKey;
-        const isCtrlPressed = e.ctrlKey || e.metaKey;
+        // 移動量の決定
+        let step = this.moveSteps;
+        if (e.shiftKey) step = this.moveStepsShift;
+        else if (e.ctrlKey || e.metaKey) step = this.moveStepsCtrl;
 
-        this.moveNodesByArrow(e.key, isShiftPressed, isCtrlPressed);
+        // 方向別の移動処理
+        const movements = {
+            'ArrowUp': [0, -step],
+            'ArrowDown': [0, step],
+            'ArrowLeft': [-step, 0],
+            'ArrowRight': [step, 0]
+        };
+        
+        const [dx, dy] = movements[e.key];
+        this.moveNodes(dx, dy);
     }
     
-    handleShiftKeyChange(e) {
-        // Shiftキーが離された時にドラッグ制限をリセット
-        if (e.type === 'keyup' && e.key === 'Shift') {
-            if (this.isShiftDragging) {
-                this.endShiftDrag();
-            }
+    handleShiftKeyUp(e) {
+        if (e.key === 'Shift' && this.shiftDragState.active) {
+            this.endShiftDrag();
         }
     }
     
     // ===============================================
     // Shift+ドラッグ制限機能
     // ===============================================
-    setupShiftDragConstraint() {
-        const self = this;
-        
-        // Pointerイベントでドラッグを監視
-        app.canvasEl.addEventListener('pointerdown', (e) => {
-            if (e.shiftKey) {
-                self.startShiftDrag(e);
-            }
-        }, { capture: true });
-        
-        app.canvasEl.addEventListener('pointermove', (e) => {
-            if (self.isShiftDragging) {
-                self.handleShiftDrag(e);
-            }
-        }, { capture: true });
-        
-        app.canvasEl.addEventListener('pointerup', (e) => {
-            if (self.isShiftDragging) {
-                self.endShiftDrag();
-            }
-        }, { capture: true });
-        
-        // ノード位置の監視（60FPS）
-        setInterval(() => {
-            if (self.isShiftDragging) {
-                self.monitorNodePositions();
-            }
-        }, 16);
+    handlePointerDown(e) {
+        if (e.shiftKey && this.getSelectedNodes().length > 0) {
+            this.startShiftDrag(e);
+        }
+    }
+    
+    handlePointerMove(e) {
+        if (this.shiftDragState.active) {
+            this.processShiftDrag(e);
+        }
+    }
+    
+    handlePointerUp(e) {
+        if (this.shiftDragState.active) {
+            this.endShiftDrag();
+        }
     }
     
     startShiftDrag(e) {
+        const state = this.shiftDragState;
         const selectedNodes = this.getSelectedNodes();
-        if (selectedNodes.length === 0) return;
         
-        this.isShiftDragging = true;
-        this.constraintDirection = null;
-        this.dragStartMouse = { x: e.clientX, y: e.clientY };
+        state.active = true;
+        state.direction = null;
+        state.startMouse = { x: e.clientX, y: e.clientY };
         
-        // 選択されたノードの開始位置を記録
-        this.nodeStartPositions.clear();
+        // 開始位置を記録
+        state.nodeStartPositions.clear();
         selectedNodes.forEach(node => {
-            this.nodeStartPositions.set(node, { x: node.pos[0], y: node.pos[1] });
+            state.nodeStartPositions.set(node, { x: node.pos[0], y: node.pos[1] });
         });
     }
     
-    handleShiftDrag(e) {
-        const deltaX = e.clientX - this.dragStartMouse.x;
-        const deltaY = e.clientY - this.dragStartMouse.y;
+    processShiftDrag(e) {
+        const state = this.shiftDragState;
+        const deltaX = e.clientX - state.startMouse.x;
+        const deltaY = e.clientY - state.startMouse.y;
         
-        // 方向の決定
-        if (!this.constraintDirection) {
+        // 方向決定（初回のみ）
+        if (!state.direction) {
             const absX = Math.abs(deltaX);
             const absY = Math.abs(deltaY);
             
-            if (absX > this.dragThreshold || absY > this.dragThreshold) {
-                this.constraintDirection = absX > absY ? 'horizontal' : 'vertical';
+            if (absX > state.threshold || absY > state.threshold) {
+                state.direction = absX > absY ? 'horizontal' : 'vertical';
             }
         }
         
-        // 方向が決定されたら即座に制限を適用
-        if (this.constraintDirection) {
-            this.applyConstraintImmediate();
+        // 制約の適用
+        if (state.direction) {
+            this.applyMovementConstraint();
         }
     }
     
-    applyConstraintImmediate() {
-        const selectedNodes = this.getSelectedNodes();
-        selectedNodes.forEach(node => {
-            const startPos = this.nodeStartPositions.get(node);
-            if (!startPos) return;
-            
-            let positionChanged = false;
-            
-            if (this.constraintDirection === 'horizontal') {
-                // 水平方向のみ移動 - Y座標を固定
-                if (node.pos[1] !== startPos.y) {
-                    node.pos[1] = startPos.y;
-                    positionChanged = true;
-                }
-            } else if (this.constraintDirection === 'vertical') {
-                // 垂直方向のみ移動 - X座標を固定
-                if (node.pos[0] !== startPos.x) {
-                    node.pos[0] = startPos.x;
-                    positionChanged = true;
-                }
-            }
-            
-            if (positionChanged) {
-                app.canvas.setDirty(true, true);
-            }
-        });
-    }
-    
-    monitorNodePositions() {
-        const selectedNodes = this.getSelectedNodes();
-        selectedNodes.forEach(node => {
-            const startPos = this.nodeStartPositions.get(node);
-            if (startPos) {
-                this.applyConstraint(node, startPos);
-            }
-        });
-    }
-    
-    applyConstraint(node, startPos) {
-        if (!this.constraintDirection) return;
-        
+    applyMovementConstraint() {
+        const state = this.shiftDragState;
         let constraintApplied = false;
         
-        if (this.constraintDirection === 'horizontal') {
-            if (node.pos[1] !== startPos.y) {
+        this.getSelectedNodes().forEach(node => {
+            const startPos = state.nodeStartPositions.get(node);
+            if (!startPos) return;
+            
+            if (state.direction === 'horizontal' && node.pos[1] !== startPos.y) {
                 node.pos[1] = startPos.y;
                 constraintApplied = true;
-            }
-        } else if (this.constraintDirection === 'vertical') {
-            if (node.pos[0] !== startPos.x) {
+            } else if (state.direction === 'vertical' && node.pos[0] !== startPos.x) {
                 node.pos[0] = startPos.x;
                 constraintApplied = true;
             }
-        }
+        });
         
         if (constraintApplied) {
             app.canvas.setDirty(true, true);
@@ -307,45 +241,40 @@ class MovementManager {
     }
     
     endShiftDrag() {
-        this.isShiftDragging = false;
-        this.constraintDirection = null;
-        this.nodeStartPositions.clear();
+        this.resetShiftDrag();
+    }
+    
+    resetShiftDrag() {
+        const state = this.shiftDragState;
+        state.active = false;
+        state.direction = null;
+        state.nodeStartPositions.clear();
     }
     
     // ===============================================
     // 選択オーバーレイの同期
     // ===============================================
     updateSelectionOverlay(dx, dy) {
-        // selection-overlay-container要素を取得
         const container = app.canvasEl.parentElement;
-        if (!container) return;
+        const overlayElement = container?.querySelector('.selection-overlay-container');
         
-        const overlayElement = container.querySelector('.selection-overlay-container');
         if (!overlayElement) return;
         
-        // 現在の位置を取得
-        const currentStyle = overlayElement.style;
-        const currentLeft = parseFloat(currentStyle.left) || 0;
-        const currentTop = parseFloat(currentStyle.top) || 0;
+        // 現在位置の取得と計算
+        const style = overlayElement.style;
+        const currentLeft = parseFloat(style.left) || 0;
+        const currentTop = parseFloat(style.top) || 0;
         
-        // キャンバスのズーム率を考慮して移動量を計算
+        // スケール考慮
         const scale = app.canvas.ds?.scale || 1;
-        const adjustedDx = dx * scale;
-        const adjustedDy = dy * scale;
+        const newLeft = currentLeft + (dx * scale);
+        const newTop = currentTop + (dy * scale);
         
-        // 新しい位置を設定
-        const newLeft = currentLeft + adjustedDx;
-        const newTop = currentTop + adjustedDy;
-        
-        overlayElement.style.left = `${newLeft}px`;
-        overlayElement.style.top = `${newTop}px`;
+        // 位置更新
+        style.left = `${newLeft}px`;
+        style.top = `${newTop}px`;
     }
 }
-
-// ===============================================
-// グローバルインスタンス
-// ===============================================
-let movementManager = null;
 
 // ===============================================
 // 設定項目の定義
@@ -362,48 +291,50 @@ const enableArrowMoveSetting = {
     },
 };
 
-const moveStepSetting = {
+const moveStepsSetting = {
     name: "Move Steps with ARROW key",
-    id: _name("MoveSteps"),
+    id: _name("moveSteps"),
     type: "slider",
     defaultValue: 100, 
     attrs: { min: 1, max: 400, step: 1 },
     onChange: (value) => {
         if (movementManager) {
-            movementManager.moveStep = value;
+            movementManager.moveSteps = value;
         }
     },
 };
 
-const moveStepShiftSetting = {
+const moveStepsShiftSetting = {
     name: "Move Steps with SHIFT+ARROW key", 
-    id: _name("MoveStepsShift"), 
+    id: _name("moveStepsShift"), 
     type: "slider", 
     defaultValue: 200, 
     attrs: { min: 1, max: 400, step: 1 }, 
     onChange: (value) => {
         if (movementManager) {
-            movementManager.moveStepShift = value;
+            movementManager.moveStepsShift = value;
         }
     }, 
 };
 
-const moveStepCtrlSetting = {
+const moveStepsCtrlSetting = {
     name: "Move Steps with CTRL+ARROW key", 
-    id: _name("MoveStepsCtrl"), 
+    id: _name("moveStepsCtrl"), 
     type: "slider", 
     defaultValue: 10, 
     attrs: { min: 1, max: 400, step: 1 }, 
     onChange: (value) => {
         if (movementManager) {
-            movementManager.moveStepCtrl = value;
+            movementManager.moveStepsCtrl = value;
         }
     }, 
 };
 
 // ===============================================
-// 拡張機能の登録
+// グローバルインスタンスと拡張機能登録
 // ===============================================
+let movementManager = null;
+
 const extension = {
     name: _name("LinearMove"),
     
@@ -413,38 +344,28 @@ const extension = {
     
     settings: [
         enableArrowMoveSetting, 
-        moveStepSetting, 
-        moveStepShiftSetting, 
-        moveStepCtrlSetting
+        moveStepsSetting, 
+        moveStepsShiftSetting, 
+        moveStepsCtrlSetting
     ].slice().reverse(),
     
     setup: async function(app) {
-        if (movementManager) {
-            // 設定の初期値を読み込み
-            const initialEnabled = app.ui.settings.getSettingValue(enableArrowMoveSetting.id);
-            const initialStep = app.ui.settings.getSettingValue(moveStepSetting.id);
-            const initialStepShift = app.ui.settings.getSettingValue(moveStepShiftSetting.id);
-            const initialStepCtrl = app.ui.settings.getSettingValue(moveStepCtrlSetting.id);
-
-            
-            // マネージャーに設定を適用
-            movementManager.enableArrowMove = initialEnabled;
-            movementManager.moveStep = initialStep;
-            movementManager.moveStepShift = initialStepShift;
-            movementManager.moveStepCtrl = initialStepCtrl;
-            
-            // 機能を初期化
-            movementManager.initialize();
-        }
+        if (!movementManager) return;
+        
+        // 設定を読み込み
+        movementManager.enableArrowMove = app.ui.settings.getSettingValue(enableArrowMoveSetting.id);
+        movementManager.moveSteps = app.ui.settings.getSettingValue(moveStepsSetting.id);
+        movementManager.moveStepsShift = app.ui.settings.getSettingValue(moveStepsShiftSetting.id);
+        movementManager.moveStepsCtrl = app.ui.settings.getSettingValue(moveStepsCtrlSetting.id);
+        
+        // 機能を初期化
+        movementManager.initialize();
         
         // ページを離れる際のクリーンアップ
         window.addEventListener('beforeunload', () => {
-            if (movementManager) {
-                movementManager.cleanup();
-            }
+            movementManager?.cleanup();
         });
     }
 };
 
-// 拡張機能を登録
 app.registerExtension(extension);
