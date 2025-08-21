@@ -563,11 +563,6 @@ const extension = {
         
         // 機能を初期化
         movementManager.initialize();
-        
-        // ページを離れる際のクリーンアップ
-        window.addEventListener('beforeunload', () => {
-            movementManager?.cleanup();
-        });
     }
 };
 
